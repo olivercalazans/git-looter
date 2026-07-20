@@ -2,7 +2,6 @@ from contextlib import closing
 import argparse
 import multiprocessing
 import os
-import os.path
 import re
 import socket
 import subprocess
@@ -155,18 +154,58 @@ class GitLooter:
             return
         
         Display.section("Fetching .git recursively")
-        process_tasks(
-            [".git/", ".gitignore"],
-            RecursiveDownloadWorker,
-            self._args.jobs,
-            args=(
-                self._args.url, self._args.directory, self._args.retry, self._args.timeout, 
-                self._args.http_headers, self._args.force
-            ),
-        )
+        self._process_tasks([".git/", ".gitignore"], RecursiveDownloadWorker)
 
         self._finalize_checkout()            
         sys.exit(0)
+
+
+
+    def _process_tasks(self, initial_tasks, worker, tasks_done=None):
+        if not initial_tasks:
+            return
+
+        tasks_seen        = set(tasks_done) if tasks_done else set()
+        pending_tasks     = multiprocessing.Queue()
+        tasks_done        = multiprocessing.Queue()
+        num_pending_tasks = 0
+
+        # add all initial tasks in the queue
+        for task in initial_tasks:
+            assert task is not None
+
+            if task not in tasks_seen:
+                pending_tasks.put(task)
+                num_pending_tasks += 1
+                tasks_seen.add(task)
+
+        # initialize processes
+        processes = [worker(pending_tasks, tasks_done, self._args) for _ in range(self._args.jobs)]
+
+        # launch them all
+        for p in processes:
+            p.start()
+
+        # collect task results
+        while num_pending_tasks > 0:
+            task_result = tasks_done.get(block=True)
+            num_pending_tasks -= 1
+
+            for task in task_result:
+                assert task is not None
+
+                if task not in tasks_seen:
+                    pending_tasks.put(task)
+                    num_pending_tasks += 1
+                    tasks_seen.add(task)
+
+
+        # send termination signal (task=None)
+        for _ in range(self._args.jobs):
+            pending_tasks.put(None)
+
+        for p in processes:
+            p.join()
     
 
 
@@ -214,15 +253,7 @@ class GitLooter:
             ".git/objects/info/packs",
         ]
 
-        process_tasks(
-            TASKS,
-            DownloadWorker,
-            self._args.jobs,
-            args=(
-                self._args.url, self._args.directory, self._args.retry, self._args.timeout, self._args.http_headers, 
-                self._args.force, self._args.client_cert_p12, self._args.client_cert_p12_password,
-            ),
-        )
+        self._process_tasks(TASKS, DownloadWorker)
 
 
     
@@ -274,16 +305,7 @@ class GitLooter:
         ]
 
         self._add_user_specified_branches(TASKS)
-
-        process_tasks(
-            TASKS,
-            FindRefsWorker,
-            self._args.jobs,
-            args=(
-                self._args.url, self._args.directory, self._args.retry, self._args.timeout, self._args.http_headers, 
-                self._args.force, self._args.client_cert_p12, self._args.client_cert_p12_password
-            ),
-        )
+        self._process_tasks(TASKS, FindRefsWorker)
 
 
     
@@ -324,15 +346,7 @@ class GitLooter:
                 tasks.append(".git/objects/pack/pack-%s.idx" % sha1)
                 tasks.append(".git/objects/pack/pack-%s.pack" % sha1)
 
-        process_tasks(
-            tasks,
-            DownloadWorker,
-            self._args.jobs,
-            args=(
-                self._args.url, self._args.directory, self._args.retry, self._args.timeout, self._args.http_headers, 
-                self._args.force, self._args.client_cert_p12, self._args.client_cert_p12_password
-            ),
-        )
+        self._process_tasks(tasks, DownloadWorker)
 
     
 
@@ -356,16 +370,7 @@ class GitLooter:
         self._process_pack_files(packed_objs, objs)
 
         Display.section("Fetching objects")
-        process_tasks(
-            objs,
-            FindObjectsWorker,
-            self._args.jobs,
-            args=(
-                self._args.url, self._args.directory, self._args.retry, self._args.timeout, self._args.http_headers, 
-                self._args.force, self._args.client_cert_p12, self._args.client_cert_p12_password
-            ),
-            tasks_done=packed_objs,
-        )
+        self._process_tasks(objs, FindObjectsWorker, tasks_done=packed_objs)
 
     
 
@@ -426,10 +431,10 @@ class GitLooter:
             
             try:
                 pack_data_path = os.path.join(pack_file_dir, filename)
-                pack_idx_path = os.path.join(pack_file_dir, filename[:-5] + ".idx")
-                pack_data = dulwich.pack.PackData(pack_data_path, ...)
-                pack_idx = dulwich.pack.load_pack_index(pack_idx_path, ...)
-                pack = dulwich.pack.Pack.from_objects(pack_data, pack_idx)
+                pack_idx_path  = os.path.join(pack_file_dir, filename[:-5] + ".idx")
+                pack_data      = dulwich.pack.PackData(pack_data_path, ...)
+                pack_idx       = dulwich.pack.load_pack_index(pack_idx_path, ...)
+                pack           = dulwich.pack.Pack.from_objects(pack_data, pack_idx)
 
                 for obj_file in pack.iterobjects():
                     packed_objs.add(obj_file.sha().hexdigest())
@@ -441,7 +446,6 @@ class GitLooter:
 
 
     def _finalize_checkout(self):
-        # git checkout
         Display.section("Running git checkout")
         os.chdir(self._args.directory)
         self._sanitize_file()
@@ -478,24 +482,24 @@ class Arguments:
 class Parser:
 
     def __init__(self):
-        self.args: argparse.Namespace = None
-        self.parser: argparse.ArgumentParser = None
+        self.args   : argparse.Namespace      = None
+        self.parser : argparse.ArgumentParser = None
 
     
     
     def parse(self):
-        self.create_args()
+        self._create_args()
         self.args = self.parser.parse_args()
-        self.valid_jobs()
-        self.valid_retry()
-        self.valid_timeout()
-        self.valid_proxy()
-        self.valid_certificate()
-        self.create_dir()
+        self._valid_jobs()
+        self._valid_retry()
+        self._valid_timeout()
+        self._valid_proxy()
+        self._valid_certificate()
+        self._create_dir()
 
     
 
-    def create_args(self):
+    def _create_args(self):
         self.parser = argparse.ArgumentParser(
             usage="git-dumper [options] URL DIR",
             description="Dump a git repository from a website.",
@@ -537,25 +541,25 @@ class Parser:
 
 
     
-    def valid_jobs(self):
+    def _valid_jobs(self):
         if self.args.jobs < 1:
             self.parser.error("invalid number of jobs, got `%d`" % self.args.jobs)
 
 
 
-    def valid_retry(self):
+    def _valid_retry(self):
         if self.args.retry < 1:
             self.parser.error("invalid number of retries, got `%d`" % self.args.retry)
 
 
 
-    def valid_timeout(self):
+    def _valid_timeout(self):
         if self.args.timeout < 1:
             self.parser.error("invalid timeout, got `%d`" % self.args.timeout)
 
 
 
-    def valid_proxy(self):
+    def _valid_proxy(self):
         if self.args.proxy:
             proxy_valid = False
 
@@ -577,7 +581,7 @@ class Parser:
 
     
 
-    def create_dir(self):
+    def _create_dir(self):
         if not os.path.exists(self.args.directory):
             os.makedirs(self.args.directory)
 
@@ -586,7 +590,7 @@ class Parser:
 
 
 
-    def valid_certificate(self):
+    def _valid_certificate(self):
         if not self.args.client_cert_p12:
             return
         
@@ -605,14 +609,14 @@ class Parser:
 
 
 
-    def valid_headers(self) -> dict:
+    def _valid_headers(self) -> dict:
         http_headers = {"User-Agent": self.args.user_agent}
         
         if not self.args.header:
             return http_headers
         
         for header in self.args.header:
-            tokens = header.split("=", maxsplit=1)
+            tokens: list[str] = header.split("=", maxsplit=1)
             
             if len(tokens) != 2:
                 self.parser.error("http header must have the form NAME=VALUE, got `%s`" % header)
@@ -634,7 +638,7 @@ class Parser:
             jobs            = self.args.jobs,
             retry           = self.args.retry,
             timeout         = self.args.timeout,
-            http_headers    = self.valid_headers(),
+            http_headers    = self._valid_headers(),
             branches        = self.args.branches,
             force           = self.args.force,
         )
@@ -778,61 +782,9 @@ def get_referenced_sha1(obj_file):
 
 
 
-def process_tasks(initial_tasks, worker, jobs, args=(), tasks_done=None):
-    if not initial_tasks:
-        return
-
-    tasks_seen = set(tasks_done) if tasks_done else set()
-    pending_tasks = multiprocessing.Queue()
-    tasks_done = multiprocessing.Queue()
-    num_pending_tasks = 0
-
-    # add all initial tasks in the queue
-    for task in initial_tasks:
-        assert task is not None
-
-        if task not in tasks_seen:
-            pending_tasks.put(task)
-            num_pending_tasks += 1
-            tasks_seen.add(task)
-
-    # initialize processes
-    processes = [worker(pending_tasks, tasks_done, args) for _ in range(jobs)]
-
-    # launch them all
-    for p in processes:
-        p.start()
-
-    # collect task results
-    while num_pending_tasks > 0:
-        task_result = tasks_done.get(block=True)
-        num_pending_tasks -= 1
-
-        for task in task_result:
-            assert task is not None
-
-            if task not in tasks_seen:
-                pending_tasks.put(task)
-                num_pending_tasks += 1
-                tasks_seen.add(task)
-
-
-    # send termination signal (task=None)
-    for _ in range(jobs):
-        pending_tasks.put(None)
-
-
-    # join all
-    for p in processes:
-        p.join()
-
-
-
-
 
 
 class Worker(multiprocessing.Process):
-    """ Worker for process_tasks """
 
     def __init__(self, pending_tasks, tasks_done, args):
         super().__init__()
@@ -840,6 +792,7 @@ class Worker(multiprocessing.Process):
         self.pending_tasks = pending_tasks
         self.tasks_done = tasks_done
         self.args = args
+
 
     def run(self):
         # initialize process
@@ -879,38 +832,52 @@ class Worker(multiprocessing.Process):
 
 class DownloadWorker(Worker):
 
-    def init(self, url, directory, retry, timeout, http_headers, force, client_cert_p12=None, client_cert_p12_password=None):
-        self.session = requests.Session()
-        self.session.verify = False
-        self.session.headers = http_headers
+    def init(self, args: Arguments):
+        if hasattr(self, '_session'):
+            return
+        
+        self._session: requests.Session = requests.Session()
+        self._configure_session(args)
+        
+    
 
-        if client_cert_p12:
-            self.session.mount(url, Pkcs12Adapter(pkcs12_filename=client_cert_p12, pkcs12_password=client_cert_p12_password))
-        else:
-            self.session.mount(url, requests.adapters.HTTPAdapter(max_retries=retry))
+    def _configure_session(self, args: Arguments):
+        self._session.verify  = False
+        self._session.headers = args.http_headers
+
+        if not args.client_cert_p12:
+            self._session.mount(args.url, requests.adapters.HTTPAdapter(max_retries=args.retry))
+            return
+        
+        self._session.mount(
+            args.url, Pkcs12Adapter(
+                pkcs12_filename=args.client_cert_p12, 
+                pkcs12_password=args.client_cert_p12_password
+            )
+        )
 
 
 
-    def do_task(self, filepath, url, directory, retry, timeout, http_headers, force, client_cert_p12=None, client_cert_p12_password=None):
-        if os.path.isfile(os.path.join(directory, filepath)):
-            print(f"[---] Already downloaded {url}/{filepath}", flush=True)
+    def do_task(self, filepath: str, args: Arguments):        
+        if os.path.isfile(os.path.join(args.directory, filepath)):
+            print(f"[---] Already downloaded {args.url}/{filepath}", flush=True)
             return []
 
         with closing(
-            self.session.get(
-                f"{url}/{filepath}",
+            self._session.get(
+                f"{args.url}/{filepath}",
                 allow_redirects=False,
                 stream=True,
-                timeout=timeout,
+                timeout=args.timeout,
             )
         ) as response:
             valid, error_msg = verify_response(response)
 
-            if not valid and force is not True:
+            if not valid and args.force is not True:
                 Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
                 return []
 
-            abspath = os.path.abspath(os.path.join(directory, filepath))
+            abspath = os.path.abspath(os.path.join(args.directory, filepath))
             create_intermediate_dirs(abspath)
 
             # write file
@@ -926,17 +893,17 @@ class DownloadWorker(Worker):
 
 class RecursiveDownloadWorker(DownloadWorker):
 
-    def do_task(self, filepath, url, directory, retry, timeout, http_headers, force):
-        if os.path.isfile(os.path.join(directory, filepath)):
-            print(f"[---] Already downloaded {url}/{filepath}", flush=True)
+    def do_task(self, filepath: str, args: Arguments):
+        if os.path.isfile(os.path.join(args.directory, filepath)):
+            print(f"[---] Already downloaded {args.url}/{filepath}", flush=True)
             return []
 
         with closing(
-            self.session.get(
-                f"{url}/{filepath}",
+            self._session.get(
+                f"{args.url}/{filepath}",
                 allow_redirects=False,
                 stream=True,
-                timeout=timeout,
+                timeout=args.timeout,
             )
         ) as response:
             Display.response(response)
@@ -958,11 +925,11 @@ class RecursiveDownloadWorker(DownloadWorker):
             else:  # file
                 valid, error_msg = verify_response(response)
 
-                if not valid and force is not True:
+                if not valid and args.force is not True:
                     Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
                     return []
 
-                abspath = os.path.abspath(os.path.join(directory, filepath))
+                abspath = os.path.abspath(os.path.join(args.directory, filepath))
                 create_intermediate_dirs(abspath)
 
                 # write file
@@ -978,20 +945,18 @@ class RecursiveDownloadWorker(DownloadWorker):
 
 class FindRefsWorker(DownloadWorker):
 
-    def do_task(self, filepath, url, directory, retry, timeout, http_headers, force, client_cert_p12=None, client_cert_p12_password=None):
-        response = self.session.get(
-            f"{url}/{filepath}", allow_redirects=False, timeout=timeout
-        )
-        
+    def do_task(self, filepath: str, args: Arguments):
+        response = self._session.get(f"{args.url}/{filepath}", allow_redirects=False, timeout=args.timeout)
+
         Display.response(response)
 
         valid, error_msg = verify_response(response)
 
-        if not valid and force is not True:
+        if not valid and args.force is not True:
             Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
             return []
 
-        abspath = os.path.abspath(os.path.join(directory, filepath))
+        abspath = os.path.abspath(os.path.join(args.directory, filepath))
         create_intermediate_dirs(abspath)
 
         # write file
@@ -1006,8 +971,8 @@ class FindRefsWorker(DownloadWorker):
         ):
             ref = ref[0]
             if not ref.endswith("*") and is_safe_path(ref):
-                tasks.append(".git/%s" % ref)
-                tasks.append(".git/logs/%s" % ref)
+                tasks.append(f".git/{ref}")
+                tasks.append(f".git/logs/{ref}")
 
         return tasks
 
@@ -1017,34 +982,35 @@ class FindRefsWorker(DownloadWorker):
 
 class FindObjectsWorker(DownloadWorker):
 
-    def do_task(self, obj, url, directory, retry, timeout, http_headers, force, client_cert_p12=None, client_cert_p12_password=None):
+    def do_task(self, obj, args: Arguments):
         filepath = ".git/objects/%s/%s" % (obj[:2], obj[2:])
 
-        if os.path.isfile(os.path.join(directory, filepath)):
-            print(f"[---] Already downloaded {url}/{filepath}",flush=True)
+        if os.path.isfile(os.path.join(args.directory, filepath)):
+            print(f"[---] Already downloaded {args.url}/{filepath}",flush=True)
         else:
-            response = self.session.get(
-                f"{url}/{filepath}",
+            response = self._session.get(
+                f"{args.url}/{filepath}",
                 allow_redirects=False,
-                timeout=timeout,
+                timeout=args.timeout,
             )
             
             Display.response(response)
 
             valid, error_msg = verify_response(response)
             
-            if not valid and force is not True:
+            if not valid and args.force is not True:
                 Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
                 return []
 
-            abspath = os.path.abspath(os.path.join(directory, filepath))
+            abspath = os.path.abspath(os.path.join(args.directory, filepath))
             create_intermediate_dirs(abspath)
 
             # write file
             with open(abspath, "wb") as f:
                 f.write(response.content)
 
-        abspath = os.path.abspath(os.path.join(directory, filepath))
+        abspath = os.path.abspath(os.path.join(args.directory, filepath))
+        
         # parse object file to find other objects
         obj_file = dulwich.objects.ShaFile.from_path(abspath)
         return get_referenced_sha1(obj_file)
