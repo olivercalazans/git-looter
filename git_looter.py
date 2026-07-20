@@ -788,15 +788,15 @@ class Worker(multiprocessing.Process):
 
     def __init__(self, pending_tasks, tasks_done, args):
         super().__init__()
-        self.daemon = True
+        self.daemon        = True
         self.pending_tasks = pending_tasks
-        self.tasks_done = tasks_done
-        self.args = args
+        self.tasks_done    = tasks_done
+        self.args          = args
+
 
 
     def run(self):
-        # initialize process
-        self.init(*self.args)
+        self.init(self.args)
 
         # fetch and do tasks
         while True:
@@ -806,7 +806,7 @@ class Worker(multiprocessing.Process):
                 return
 
             try:
-                result = self.do_task(task, *self.args)
+                result = self.do_task(task, self.args)
             except Exception:
                 Display.warning(f"Task {task} raised exception:", file=sys.stderr)
                 traceback.print_exc()
@@ -819,11 +819,11 @@ class Worker(multiprocessing.Process):
             self.tasks_done.put(result)
 
 
-    def init(self, *args):
+    def init(self, args: Arguments):
         raise NotImplementedError
 
 
-    def do_task(self, task, *args):
+    def do_task(self, task, args: Arguments) -> list:
         raise NotImplementedError
 
 
@@ -858,7 +858,7 @@ class DownloadWorker(Worker):
 
 
 
-    def do_task(self, filepath: str, args: Arguments):        
+    def do_task(self, filepath: str, args: Arguments) -> list:        
         if os.path.isfile(os.path.join(args.directory, filepath)):
             print(f"[---] Already downloaded {args.url}/{filepath}", flush=True)
             return []
@@ -893,7 +893,7 @@ class DownloadWorker(Worker):
 
 class RecursiveDownloadWorker(DownloadWorker):
 
-    def do_task(self, filepath: str, args: Arguments):
+    def do_task(self, filepath: str, args: Arguments) -> list:
         if os.path.isfile(os.path.join(args.directory, filepath)):
             print(f"[---] Already downloaded {args.url}/{filepath}", flush=True)
             return []
@@ -922,22 +922,23 @@ class RecursiveDownloadWorker(DownloadWorker):
                     filepath + filename
                     for filename in get_indexed_files(response)
                 ]
-            else:  # file
-                valid, error_msg = verify_response(response)
+            
+            # file
+            valid, error_msg = verify_response(response)
 
-                if not valid and args.force is not True:
-                    Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
-                    return []
-
-                abspath = os.path.abspath(os.path.join(args.directory, filepath))
-                create_intermediate_dirs(abspath)
-
-                # write file
-                with open(abspath, "wb") as f:
-                    for chunk in response.iter_content(4096):
-                        f.write(chunk)
-
+            if not valid and args.force is not True:
+                Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
                 return []
+            
+            abspath = os.path.abspath(os.path.join(args.directory, filepath))
+            create_intermediate_dirs(abspath)
+            # write file
+            
+            with open(abspath, "wb") as f:
+                for chunk in response.iter_content(4096):
+                    f.write(chunk)
+            
+            return []
 
 
 
@@ -945,7 +946,7 @@ class RecursiveDownloadWorker(DownloadWorker):
 
 class FindRefsWorker(DownloadWorker):
 
-    def do_task(self, filepath: str, args: Arguments):
+    def do_task(self, filepath: str, args: Arguments) -> list:
         response = self._session.get(f"{args.url}/{filepath}", allow_redirects=False, timeout=args.timeout)
 
         Display.response(response)
@@ -982,7 +983,7 @@ class FindRefsWorker(DownloadWorker):
 
 class FindObjectsWorker(DownloadWorker):
 
-    def do_task(self, obj, args: Arguments):
+    def do_task(self, obj, args: Arguments) -> list:
         filepath = ".git/objects/%s/%s" % (obj[:2], obj[2:])
 
         if os.path.isfile(os.path.join(args.directory, filepath)):
