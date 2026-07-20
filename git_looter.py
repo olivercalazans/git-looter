@@ -15,12 +15,15 @@ import dulwich.objects
 import dulwich.pack
 import requests
 import socks
+import time
 from dataclasses import dataclass
 from requests_pkcs12 import Pkcs12Adapter
 
 
 
 class GitLooter:
+
+    __slots__ = ('_args', '_session', '_response', '_environment')
 
     def __init__(self):
         self._args        : Arguments         = None
@@ -57,11 +60,31 @@ class GitLooter:
     def _create_session(self):
         self._session         = requests.Session()
         self._session.verify  = False
-        self._session.headers = self._args.http_headers
+        self._set_http_headers()
         self._configure_session()
 
         if os.listdir(self._args.directory):
             Display.warning(f"Destination '{self._args.directory}' is not empty")
+
+
+
+    def _set_http_headers(self):
+        if self._args.http_headers:
+            self._session.headers = self._args.http_headers
+            return
+        
+        self._session.headers.update({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+        })
 
 
 
@@ -102,6 +125,7 @@ class GitLooter:
                 timeout = self._args.timeout,
                 allow_redirects = False
             )
+            time.sleep(self._args.delay)
         except Exception as e:
             Display.fatal(f"Unable to connect to {self._args.url}. Error: {e}")
 
@@ -143,7 +167,10 @@ class GitLooter:
 
     def _try_fast_dump(self):
         Display.section("Trying fast dumping")
+        
         response = self._session.get(f"{self._args.url}/.git/", allow_redirects=False)
+        time.sleep(self._args.delay)
+
         Display.response(response)
 
         if (
@@ -463,17 +490,18 @@ class GitLooter:
 
 @dataclass(slots=True)
 class Arguments:
+    client_cert_p12_password: str
+    client_cert_p12 : str
     url             : str
     directory       : str
     proxy           : str
-    client_cert_p12 : str
-    client_cert_p12_password: str
     jobs            : int
     retry           : int
     timeout         : int
     http_headers    : dict[str, str]
     branches        : list[str]
     force           : bool
+    delay           : float
 
 
 
@@ -481,60 +509,64 @@ class Arguments:
 
 class Parser:
 
+    __slots__ = ('_args', '_parser')
+
     def __init__(self):
-        self.args   : argparse.Namespace      = None
-        self.parser : argparse.ArgumentParser = None
+        self._args   : argparse.Namespace      = None
+        self._parser : argparse.ArgumentParser = None
 
     
     
     def parse(self):
         self._create_args()
-        self.args = self.parser.parse_args()
+        self._args = self._parser.parse_args()
         self._valid_jobs()
         self._valid_retry()
         self._valid_timeout()
         self._valid_proxy()
         self._valid_certificate()
+        self._valid_delay()
         self._create_dir()
 
     
 
     def _create_args(self):
-        self.parser = argparse.ArgumentParser(
+        self._parser = argparse.ArgumentParser(
             usage="git-dumper [options] URL DIR",
             description="Dump a git repository from a website.",
         )
-        self.parser.add_argument("url", metavar="URL", help="URL")
-        self.parser.add_argument("directory", metavar="DIR", help="Output directory")
-        self.parser.add_argument("--proxy", help="Use the specified proxy")
-        self.parser.add_argument("--client-cert-p12", help="Client certificate in PKCS#12")
-        self.parser.add_argument("--client-cert-p12-password", help="Password for the client certificate")
-        self.parser.add_argument(
+        self._parser.add_argument("url", metavar="URL", help="URL")
+        self._parser.add_argument("directory", metavar="DIR", help="Output directory")
+        self._parser.add_argument("--proxy", help="Use the specified proxy")
+        self._parser.add_argument("--client-cert-p12", help="Client certificate in PKCS#12")
+        self._parser.add_argument("--client-cert-p12-password", help="Password for the client certificate")
+        self._parser.add_argument("-d", "--delay", type=float, default=0, help="Delay between requests")
+        self._parser.add_argument(
             "-j", "--jobs", type=int, default=10,
             help="Number of simultaneous requests",
         )
-        self.parser.add_argument(
+        self._parser.add_argument(
             "-r", "--retry", type=int, default=3,
             help="Number of request attempts before giving up",
         )
-        self.parser.add_argument(
+        self._parser.add_argument(
             "-t", "--timeout", type=int, default=3,
             help="Maximum time in seconds before giving up",
         )
-        self.parser.add_argument(
+        self._parser.add_argument(
             "-u", "--user-agent", type=str,
             default="Mozilla/5.0 (Windows NT 10.0; rv:78.0) Gecko/20100101 Firefox/78.0",
             help="User-agent to use for requests",
         )
-        self.parser.add_argument(
+        self._parser.add_argument(
             "-H", "--header", type=str, action="append",
             help="Additional http headers, e.g `NAME=VALUE`",
         )
-        self.parser.add_argument(
+        self._parser.add_argument(
             "-b", "--branch", dest="branches", action="append",
             help="Additional branch names to check for, e.g. `-b dev -b prod`. The default branches (`main`, `master`, `staging`, `production`, `development`) are always checked.",
         )
-        self.parser.add_argument(
+        self._parser.add_argument(
             "-F", "--force", action="store_true",
             help="Ignore any non fatal error",
         )
@@ -542,25 +574,31 @@ class Parser:
 
     
     def _valid_jobs(self):
-        if self.args.jobs < 1:
-            self.parser.error("invalid number of jobs, got `%d`" % self.args.jobs)
+        if self._args.jobs < 1:
+            self._parser.error(f"Invalid number of jobs, got {self._args.jobs}")
 
 
 
     def _valid_retry(self):
-        if self.args.retry < 1:
-            self.parser.error("invalid number of retries, got `%d`" % self.args.retry)
+        if self._args.retry < 1:
+            self._parser.error(f"Invalid number of retries, got {self._args.retry}")
 
 
 
     def _valid_timeout(self):
-        if self.args.timeout < 1:
-            self.parser.error("invalid timeout, got `%d`" % self.args.timeout)
+        if self._args.timeout < 1:
+            self._parser.error(f"Invalid timeout, got {self._args.timeout}")
+
+    
+
+    def _valid_delay(self):
+        if self._args.delay < 0:
+            self._parser.error(f"Delay value cannot be negative. Got {self._args.delay}")
 
 
 
     def _valid_proxy(self):
-        if self.args.proxy:
+        if self._args.proxy:
             proxy_valid = False
 
             for pattern, proxy_type in [
@@ -569,7 +607,7 @@ class Parser:
                 (r"^http://(.*):(\d+)$", socks.PROXY_TYPE_HTTP),
                 (r"^(.*):(\d+)$", socks.PROXY_TYPE_SOCKS5),
             ]:
-                m = re.match(pattern, self.args.proxy)
+                m = re.match(pattern, self._args.proxy)
                 if m:
                     socks.setdefaultproxy(proxy_type, m.group(1), int(m.group(2)))
                     socket.socket = socks.socksocket
@@ -577,49 +615,49 @@ class Parser:
                     break
 
             if not proxy_valid:
-                self.parser.error("invalid proxy, got `%s`" % self.args.proxy)
+                self._parser.error(f"Invalid proxy, got {self._args.proxy}")
 
     
 
     def _create_dir(self):
-        if not os.path.exists(self.args.directory):
-            os.makedirs(self.args.directory)
+        if not os.path.exists(self._args.directory):
+            os.makedirs(self._args.directory)
 
-        if not os.path.isdir(self.args.directory):
-            self.parser.error("`%s` is not a directory" % self.args.directory)
+        if not os.path.isdir(self._args.directory):
+            self._parser.error(f"{self._args.directory} is not a directory")
 
 
 
     def _valid_certificate(self):
-        if not self.args.client_cert_p12:
+        if not self._args.client_cert_p12:
             return
         
-        if not os.path.exists(self.args.client_cert_p12):
-            self.parser.error(
-                "client certificate `%s` does not exist" % self.args.client_cert_p12
+        if not os.path.exists(self._args.client_cert_p12):
+            self._parser.error(
+                f"Client certificate {self._args.client_cert_p12} does not exist"
             )
 
-        if not os.path.isfile(self.args.client_cert_p12):
-            self.parser.error(
-                "client certificate `%s` is not a file" % self.args.client_cert_p12
+        if not os.path.isfile(self._args.client_cert_p12):
+            self._parser.error(
+                f"Client certificate {self._args.client_cert_p12} is not a file"
             )
 
-        if self.args.client_cert_p12_password is None:
-            self.parser.error("client certificate password is required")
+        if self._args.client_cert_p12_password is None:
+            self._parser.error("Client certificate password is required")
 
 
 
     def _valid_headers(self) -> dict:
-        http_headers = {"User-Agent": self.args.user_agent}
+        http_headers = {"User-Agent": self._args.user_agent}
         
-        if not self.args.header:
+        if not self._args.header:
             return http_headers
         
-        for header in self.args.header:
+        for header in self._args.header:
             tokens: list[str] = header.split("=", maxsplit=1)
             
             if len(tokens) != 2:
-                self.parser.error("http header must have the form NAME=VALUE, got `%s`" % header)
+                self._parser.error(f"HTTP header must have the form NAME=VALUE, got {header}")
             
             name, value = tokens
             http_headers[name.strip()] = value.strip()
@@ -630,17 +668,18 @@ class Parser:
     
     def get_args(self) -> Arguments:
         return Arguments(
-            client_cert_p12_password = self.args.client_cert_p12_password,
-            client_cert_p12 = self.args.client_cert_p12,
-            directory       = self.args.directory,
-            proxy           = self.args.proxy,
-            url             = self.args.url,
-            jobs            = self.args.jobs,
-            retry           = self.args.retry,
-            timeout         = self.args.timeout,
+            client_cert_p12_password = self._args.client_cert_p12_password,
+            client_cert_p12 = self._args.client_cert_p12,
+            directory       = self._args.directory,
+            proxy           = self._args.proxy,
+            url             = self._args.url,
+            jobs            = self._args.jobs,
+            retry           = self._args.retry,
+            timeout         = self._args.timeout,
             http_headers    = self._valid_headers(),
-            branches        = self.args.branches,
-            force           = self.args.force,
+            branches        = self._args.branches,
+            force           = self._args.force,
+            delay           = self._args.delay,
         )
 
 
@@ -655,6 +694,7 @@ class Display:
         if   code >= 400: x = f"\033[31m{code}\033[0m"   # red
         elif code >= 300: x = f"\033[33m{code}\033[0m"   # orange
         elif code >= 200: x = f"\033[32m{code}\033[0m"   # green
+        else:             x = f"{code}"
 
         print(f"[{x}] {responde.url}", flush=True)
 
@@ -836,7 +876,8 @@ class DownloadWorker(Worker):
         if hasattr(self, '_session'):
             return
         
-        self._session: requests.Session = requests.Session()
+        self._session : requests.Session = requests.Session()
+        self._delay   : float            = args.delay 
         self._configure_session(args)
         
     
@@ -856,6 +897,16 @@ class DownloadWorker(Worker):
             )
         )
 
+    
+
+    def _request(self, url: str, **kwargs) -> requests.Response:
+        response = self._session.get(url, **kwargs)
+        
+        if self._delay > 0:
+            time.sleep(self._delay)
+        
+        return response
+
 
 
     def do_task(self, filepath: str, args: Arguments) -> list:        
@@ -864,7 +915,7 @@ class DownloadWorker(Worker):
             return []
 
         with closing(
-            self._session.get(
+            self._request(
                 f"{args.url}/{filepath}",
                 allow_redirects=False,
                 stream=True,
@@ -899,7 +950,7 @@ class RecursiveDownloadWorker(DownloadWorker):
             return []
 
         with closing(
-            self._session.get(
+            self._request(
                 f"{args.url}/{filepath}",
                 allow_redirects=False,
                 stream=True,
@@ -947,9 +998,7 @@ class RecursiveDownloadWorker(DownloadWorker):
 class FindRefsWorker(DownloadWorker):
 
     def do_task(self, filepath: str, args: Arguments) -> list:
-        response = self._session.get(f"{args.url}/{filepath}", allow_redirects=False, timeout=args.timeout)
-
-        Display.response(response)
+        response = self._request(f"{args.url}/{filepath}", allow_redirects=False, timeout=args.timeout)
 
         valid, error_msg = verify_response(response)
 
@@ -989,14 +1038,12 @@ class FindObjectsWorker(DownloadWorker):
         if os.path.isfile(os.path.join(args.directory, filepath)):
             print(f"[---] Already downloaded {args.url}/{filepath}",flush=True)
         else:
-            response = self._session.get(
+            response = self._request(
                 f"{args.url}/{filepath}",
                 allow_redirects=False,
                 timeout=args.timeout,
             )
             
-            Display.response(response)
-
             valid, error_msg = verify_response(response)
             
             if not valid and args.force is not True:
