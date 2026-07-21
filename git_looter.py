@@ -70,21 +70,16 @@ class GitLooter:
 
     def _set_http_headers(self):
         if self._args.http_headers:
-            self._session.headers = self._args.http_headers
+            self._session.headers.update(self._args.http_headers)
+            self._session.headers.pop("Accept-Encoding", None)
             return
-        
+
         self._session.headers.update({
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Cache-Control": "max-age=0",
+            "User-Agent": "curl/8.14.1",
+            "Accept": "*/*",
         })
+
+        self._session.headers.pop("Accept-Encoding", None)
 
 
 
@@ -123,7 +118,6 @@ class GitLooter:
             self._response = self._session.get(
                 f"{self._args.url}/.git/HEAD",
                 timeout = self._args.timeout,
-                allow_redirects = False
             )
             time.sleep(self._args.delay)
         except Exception as e:
@@ -139,7 +133,7 @@ class GitLooter:
         
         elif self._response.status_code >= 300:
             Display.warning(f"Redirection required to {self._response.headers['Location']}")
-            sys.exit(1)
+            sys.exit(0)
         
         if self._args.force:
             Display.warning("Force flag used. Ignoring non fatal errors...")
@@ -648,7 +642,7 @@ class Parser:
 
 
     def _valid_headers(self) -> dict:
-        http_headers = {"User-Agent": self._args.user_agent}
+        http_headers = {}
         
         if not self._args.header:
             return http_headers
@@ -687,6 +681,8 @@ class Parser:
 
 class Display:
 
+    HTML: str = " [\033[34mHTML\033[0m] "
+
     @staticmethod
     def response(responde: requests.Response):
         code = responde.status_code
@@ -696,7 +692,9 @@ class Display:
         elif code >= 200: x = f"\033[32m{code}\033[0m"   # green
         else:             x = f"{code}"
 
-        print(f"[{x}] {responde.url}", flush=True)
+        z = Display.HTML if is_html(responde) else ' '
+
+        print(f"[{x}]{z}{responde.url}", flush=True)
 
 
     @staticmethod
@@ -876,15 +874,28 @@ class DownloadWorker(Worker):
         if hasattr(self, '_session'):
             return
         
-        self._session : requests.Session = requests.Session()
         self._delay   : float            = args.delay 
+        self._session : requests.Session = requests.Session()         
+        self._session.verify = False
+
+        if hasattr(args, 'cookies') and args.cookies:
+            self._session.cookies.update(args.cookies)
+
         self._configure_session(args)
         
     
 
     def _configure_session(self, args: Arguments):
-        self._session.verify  = False
-        self._session.headers = args.http_headers
+        self._session.headers.clear()
+        self._session.headers.update({
+            "User-Agent": "curl/8.14.1",
+            "Accept": "*/*",
+        })
+
+        self._session.headers.pop("Accept-Encoding", None)
+
+        if args.http_headers:
+            self._session.headers.update(args.http_headers)
 
         if not args.client_cert_p12:
             self._session.mount(args.url, requests.adapters.HTTPAdapter(max_retries=args.retry))
@@ -1068,6 +1079,9 @@ class FindObjectsWorker(DownloadWorker):
 
 
 if __name__ == "__main__":
-    git_looter = GitLooter()
-    git_looter.execute()
-    sys.exit(0)
+    try:
+        git_looter = GitLooter()
+        git_looter.execute()
+        sys.exit(0)
+    except KeyboardInterrupt : pass
+    except Exception as e    : Display.fatal(f'{e}')
