@@ -60,26 +60,12 @@ class GitLooter:
     def _create_session(self):
         self._session         = requests.Session()
         self._session.verify  = False
-        self._set_http_headers()
+        self._session.headers.update(self._args.http_headers)
+        self._session.headers.pop("Accept-Encoding", None)
         self._configure_session()
 
         if os.listdir(self._args.directory):
             Display.warning(f"Destination '{self._args.directory}' is not empty")
-
-
-
-    def _set_http_headers(self):
-        if self._args.http_headers:
-            self._session.headers.update(self._args.http_headers)
-            self._session.headers.pop("Accept-Encoding", None)
-            return
-
-        self._session.headers.update({
-            "User-Agent": "curl/8.14.1",
-            "Accept": "*/*",
-        })
-
-        self._session.headers.pop("Accept-Encoding", None)
 
 
 
@@ -135,10 +121,6 @@ class GitLooter:
             Display.warning(f"Redirection required to {self._response.headers['Location']}")
             sys.exit(0)
         
-        if self._args.force:
-            Display.warning("Force flag used. Ignoring non fatal errors...")
-            return
-        
         if not valid:
             Display.fatal(f"Invalid responde from {self._response.url}: {error_msg}")
        
@@ -182,7 +164,7 @@ class GitLooter:
 
 
 
-    def _process_tasks(self, initial_tasks, worker, tasks_done=None):
+    def _process_tasks(self, initial_tasks: list, worker, tasks_done=None):
         if not initial_tasks:
             return
 
@@ -494,7 +476,6 @@ class Arguments:
     timeout         : int
     http_headers    : dict[str, str]
     branches        : list[str]
-    force           : bool
     delay           : float
 
 
@@ -559,10 +540,6 @@ class Parser:
         self._parser.add_argument(
             "-b", "--branch", dest="branches", action="append",
             help="Additional branch names to check for, e.g. `-b dev -b prod`. The default branches (`main`, `master`, `staging`, `production`, `development`) are always checked.",
-        )
-        self._parser.add_argument(
-            "-F", "--force", action="store_true",
-            help="Ignore any non fatal error",
         )
 
 
@@ -642,7 +619,10 @@ class Parser:
 
 
     def _valid_headers(self) -> dict:
-        http_headers = {}
+        http_headers = {
+            "User-Agent": "curl/8.14.1",
+            "Accept": "*/*",
+        }
         
         if not self._args.header:
             return http_headers
@@ -672,7 +652,6 @@ class Parser:
             timeout         = self._args.timeout,
             http_headers    = self._valid_headers(),
             branches        = self._args.branches,
-            force           = self._args.force,
             delay           = self._args.delay,
         )
 
@@ -763,10 +742,10 @@ def verify_response(response: requests.Response) -> tuple[bool, str]:
     Display.response(response)
 
     if response.status_code >= 400:
-        return False, f"unreachable URL ({response.url}). Responded with code {response.status_code}"
+        return False, ""
     
     elif response.status_code >= 300 and "Location" in response.headers:
-        return False, f"moved to {response.headers['Location']}. Code {response.status_code}"
+        return False, f"Moved to {response.headers['Location']}. Code {response.status_code}"
     
     elif (
         "Content-Length" in response.headers
@@ -775,7 +754,7 @@ def verify_response(response: requests.Response) -> tuple[bool, str]:
         return False, "responded with a zero-length body"
     
     elif is_html(response):
-        return False, "responded with HTML"
+        return False, ""
     
     else:
         return True, ""
@@ -824,12 +803,17 @@ def get_referenced_sha1(obj_file):
 
 class Worker(multiprocessing.Process):
 
-    def __init__(self, pending_tasks, tasks_done, args):
+    def __init__(
+            self, 
+            pending_tasks : multiprocessing.Queue, 
+            tasks_done    : multiprocessing.Queue,
+            args          : Arguments
+        ):
         super().__init__()
-        self.daemon        = True
-        self.pending_tasks = pending_tasks
-        self.tasks_done    = tasks_done
-        self.args          = args
+        self.daemon        : bool                  = True
+        self.pending_tasks : multiprocessing.Queue = pending_tasks
+        self.tasks_done    : multiprocessing.Queue = tasks_done
+        self.args          : Arguments             = args
 
 
 
@@ -876,26 +860,16 @@ class DownloadWorker(Worker):
         
         self._delay   : float            = args.delay 
         self._session : requests.Session = requests.Session()         
+        
         self._session.verify = False
-
-        if hasattr(args, 'cookies') and args.cookies:
-            self._session.cookies.update(args.cookies)
-
         self._configure_session(args)
         
     
 
     def _configure_session(self, args: Arguments):
         self._session.headers.clear()
-        self._session.headers.update({
-            "User-Agent": "curl/8.14.1",
-            "Accept": "*/*",
-        })
-
+        self._session.headers.update(args.http_headers)
         self._session.headers.pop("Accept-Encoding", None)
-
-        if args.http_headers:
-            self._session.headers.update(args.http_headers)
 
         if not args.client_cert_p12:
             self._session.mount(args.url, requests.adapters.HTTPAdapter(max_retries=args.retry))
@@ -935,8 +909,9 @@ class DownloadWorker(Worker):
         ) as response:
             valid, error_msg = verify_response(response)
 
-            if not valid and args.force is not True:
-                Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
+            if not valid:
+                if error_msg:
+                    Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
                 return []
 
             abspath = os.path.abspath(os.path.join(args.directory, filepath))
@@ -988,8 +963,9 @@ class RecursiveDownloadWorker(DownloadWorker):
             # file
             valid, error_msg = verify_response(response)
 
-            if not valid and args.force is not True:
-                Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
+            if not valid:
+                if error_msg:
+                    Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
                 return []
             
             abspath = os.path.abspath(os.path.join(args.directory, filepath))
@@ -1013,8 +989,9 @@ class FindRefsWorker(DownloadWorker):
 
         valid, error_msg = verify_response(response)
 
-        if not valid and args.force is not True:
-            Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
+        if not valid:
+            if error_msg:
+                Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
             return []
 
         abspath = os.path.abspath(os.path.join(args.directory, filepath))
@@ -1044,36 +1021,47 @@ class FindRefsWorker(DownloadWorker):
 class FindObjectsWorker(DownloadWorker):
 
     def do_task(self, obj, args: Arguments) -> list:
-        filepath = ".git/objects/%s/%s" % (obj[:2], obj[2:])
+        filepath = f".git/objects/{obj[:2]}/{obj[2:]}"
 
         if os.path.isfile(os.path.join(args.directory, filepath)):
             print(f"[---] Already downloaded {args.url}/{filepath}",flush=True)
         else:
-            response = self._request(
-                f"{args.url}/{filepath}",
-                allow_redirects=False,
-                timeout=args.timeout,
-            )
-            
-            valid, error_msg = verify_response(response)
-            
-            if not valid and args.force is not True:
-                Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
+            if not self._get_obj(filepath, args):
                 return []
 
-            abspath = os.path.abspath(os.path.join(args.directory, filepath))
-            create_intermediate_dirs(abspath)
-
-            # write file
-            with open(abspath, "wb") as f:
-                f.write(response.content)
-
-        abspath = os.path.abspath(os.path.join(args.directory, filepath))
+        try:
+            abspath = os.path.abspath(os.path.join(args.directory, filepath))        
+            obj_file = dulwich.objects.ShaFile.from_path(abspath)
+            return get_referenced_sha1(obj_file)
         
-        # parse object file to find other objects
-        obj_file = dulwich.objects.ShaFile.from_path(abspath)
-        return get_referenced_sha1(obj_file)
+        except Exception as e:
+            Display.warning(f"Error while parsing file {filepath}: {e}")
+            return []
 
+
+    
+    def _get_obj(self, filepath: str, args: Arguments) -> bool:
+        response = self._request(
+            f"{args.url}/{filepath}",
+            allow_redirects=False,
+            timeout=args.timeout,
+        )
+        
+        valid, error_msg = verify_response(response)
+        
+        if not valid:
+            if error_msg:
+                Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
+            return False
+        
+        abspath = os.path.abspath(os.path.join(args.directory, filepath))
+        create_intermediate_dirs(abspath)
+        
+        # write file
+        with open(abspath, "wb") as f:
+            f.write(response.content)
+        
+        return True
 
 
 
