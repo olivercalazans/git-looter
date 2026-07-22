@@ -112,7 +112,7 @@ class GitLooter:
 
 
     def _valid_response(self):
-        valid, error_msg = verify_response(self._response)
+        valid, _, error_msg = verify_response(self._response)
 
         if self._response.status_code >= 400:
             Display.fatal("Target unreachable. Dumping stopped")
@@ -682,13 +682,13 @@ class Display:
 
 
     @staticmethod
-    def warning(text: str, file=sys.stdout):
-        print(f"[\033[33m{'!!!'}\033[0m] {text}", flush=True, file=file)
+    def warning(text: str):
+        print(f"[\033[33m{'!!!'}\033[0m] {text}", flush=True)
 
 
     @staticmethod
     def fatal(text: str):
-        print(f"[\033[31m{'ERR'}\033[0m] {text}", flush=True, file=sys.stderr)
+        print(f"[\033[31m{'ERR'}\033[0m] {text}", flush=True)
         sys.exit(1)
 
 
@@ -738,26 +738,26 @@ def get_indexed_files(response: requests.Response) -> list:
 
 
 
-def verify_response(response: requests.Response) -> tuple[bool, str]:
+def verify_response(response: requests.Response) -> tuple[bool, bool, str]:
     Display.response(response)
 
     if response.status_code >= 400:
-        return False, ""
+        return False, False, None
     
     elif response.status_code >= 300 and "Location" in response.headers:
-        return False, f"Moved to {response.headers['Location']}. Code {response.status_code}"
+        return False, True, f"Moved to {response.headers['Location']}. Code {response.status_code}"
     
     elif (
         "Content-Length" in response.headers
         and response.headers["Content-Length"] == 0
     ):
-        return False, "responded with a zero-length body"
+        return False, True, "Responded with a zero-length body"
     
     elif is_html(response):
-        return False, ""
+        return False, True, f"{response.url} responded with a HTML"
     
     else:
-        return True, ""
+        return True, False, None
 
 
 
@@ -830,7 +830,7 @@ class Worker(multiprocessing.Process):
             try:
                 result = self.do_task(task, self.args)
             except Exception:
-                Display.warning(f"Task {task} raised exception:", file=sys.stderr)
+                Display.warning(f"Task {task} raised exception:")
                 traceback.print_exc()
                 result = []
 
@@ -907,11 +907,11 @@ class DownloadWorker(Worker):
                 timeout=args.timeout,
             )
         ) as response:
-            valid, error_msg = verify_response(response)
+            valid, display, error_msg = verify_response(response)
 
             if not valid:
-                if error_msg:
-                    Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
+                if display:
+                    Display.warning(f"Invalid response from {response.url}: {error_msg}")
                 return []
 
             abspath = os.path.abspath(os.path.join(args.directory, filepath))
@@ -961,11 +961,11 @@ class RecursiveDownloadWorker(DownloadWorker):
                 ]
             
             # file
-            valid, error_msg = verify_response(response)
+            valid, display, error_msg = verify_response(response)
 
             if not valid:
-                if error_msg:
-                    Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
+                if display:
+                    Display.warning(f"Invalid response from {response.url}: {error_msg}")
                 return []
             
             abspath = os.path.abspath(os.path.join(args.directory, filepath))
@@ -987,11 +987,11 @@ class FindRefsWorker(DownloadWorker):
     def do_task(self, filepath: str, args: Arguments) -> list:
         response = self._request(f"{args.url}/{filepath}", allow_redirects=False, timeout=args.timeout)
 
-        valid, error_msg = verify_response(response)
+        valid, display, error_msg = verify_response(response)
 
         if not valid:
-            if error_msg:
-                Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
+            if display:
+                Display.warning(f"Invalid response from {response.url}: {error_msg}")
             return []
 
         abspath = os.path.abspath(os.path.join(args.directory, filepath))
@@ -1047,11 +1047,11 @@ class FindObjectsWorker(DownloadWorker):
             timeout=args.timeout,
         )
         
-        valid, error_msg = verify_response(response)
+        valid, display, error_msg = verify_response(response)
         
         if not valid:
-            if error_msg:
-                Display.warning(f"Invalid response from {response.url}: {error_msg}", file=sys.stderr)
+            if display:
+                Display.warning(f"Invalid response from {response.url}: {error_msg}")
             return False
         
         abspath = os.path.abspath(os.path.join(args.directory, filepath))
